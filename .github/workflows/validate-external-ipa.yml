@@ -1,0 +1,80 @@
+name: Validate external EeveeSpotify IPAs (metadata only)
+
+on:
+  push:
+    branches: [Master]
+    paths:
+      - .github/workflows/validate-external-ipa.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    name: Inspect ${{ matrix.variant }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: unpatched
+            url: https://files.catbox.moe/x7l9ca.ipa
+          - variant: patched
+            url: https://files.catbox.moe/ogibmn.ipa
+
+    steps:
+      - name: Download for structural inspection
+        env:
+          IPA_URL: ${{ matrix.url }}
+        run: |
+          curl -fLsS --retry 1 --connect-timeout 15 --max-time 240 \
+            -A 'EeveeSpotify-archive-inspection/1.0' \
+            "$IPA_URL" -o candidate.ipa
+          test "$(wc -c < candidate.ipa)" -gt 1000000
+          file candidate.ipa
+          sha256sum candidate.ipa
+
+      - name: Inspect ZIP metadata without executing files
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, plistlib, zipfile
+          path="candidate.ipa"
+          with open(path, "rb") as f:
+              h=hashlib.file_digest(f, "sha256").hexdigest()
+          with zipfile.ZipFile(path) as z:
+              files=z.namelist()
+              pls=[p for p in files if p.startswith("Payload/") and p.endswith(".app/Info.plist") and p.count("/") == 2]
+              if len(pls) != 1: raise RuntimeError("Expected exactly one main app plist, got: "+str(pls))
+              info=z.getinfo(pls[0])
+              if info.file_size > 2_000_000: raise RuntimeError("App plist is unusually large")
+              plist=plistlib.loads(z.read(pls[0]))
+              appdir=pls[0].removesuffix("Info.plist")
+              links=[p for p in files if p.startswith(appdir) and (p.endswith(".dylib") or ".framework/" in p or ".appex/" in p)]
+              eevee=[p for p in links if any(s in p.lower() for s in ("eevee","zxpluginsinject"))]
+              summary={
+                "variant":os.environ["VARIANT"],
+                "bytes":os.path.getsize(path),
+                "sha256":h,
+                "bundleID":plist.get("CFBundleIdentifier"),
+                "bundleVersion":plist.get("CFBundleShortVersionString"),
+                "minOS":plist.get("MinimumOSVersion"),
+                "mainExecutable":plist.get("CFBundleExecutable"),
+                "zipFileCount":len(files),
+                "embeddedEeveeCandidates":eevee[:30],
+                "otherEmbeddedBinaryCount":len(links)-len(eevee)
+              }
+              print(json.dumps(summary,ensure_ascii=False,indent=2))
+              with open(os.environ["GITHUB_STEP_SUMMARY"],"a") as out:
+                  out.write("### "+summary["variant"]+"\n")
+                  out.write("- Bundle ID: `"+str(summary["bundleID"])+"`\n")
+                  out.write("- Version: `"+str(summary["bundleVersion"])+"`\n")
+                  out.write("- Minimum iOS: `"+str(summary["minOS"])+"`\n")
+                  out.write("- Size: `"+str(summary["bytes"])+"` bytes\n")
+                  out.write("- SHA-256: `"+h+"`\n")
+                  out.write("- Eevee-related packaged paths: `"+str(len(eevee))+"`\n")
+                  out.write("\nThis checks structure only, not trust, runtime function, or signatures.\n")
+          PY
